@@ -2,6 +2,7 @@ package com.github.kr328.clash
 
 import android.app.Application
 import android.content.Context
+import com.github.kr328.clash.api.ApiControlService
 import com.github.kr328.clash.common.Global
 import com.github.kr328.clash.common.compat.currentProcessName
 import com.github.kr328.clash.common.log.Log
@@ -30,6 +31,8 @@ class MainApplication : Application() {
 
         if (processName == packageName) {
             Remote.launch()
+            // 进程一启动就把 9091 合并控制面挂起来，不依赖任何 Activity / VPN 是否已连
+            ApiControlService.launch(this)
         } else {
             sendServiceRecreated()
         }

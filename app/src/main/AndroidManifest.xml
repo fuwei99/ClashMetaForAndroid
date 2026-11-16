@@ -10,6 +10,7 @@
         android:required="false" />
 
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission
         android:name="android.permission.QUERY_ALL_PACKAGES"
@@ -187,6 +188,25 @@
             android:configChanges="uiMode"
             android:exported="false"
             android:label="@string/files" />
+
+        <!-- CMFA 合并控制面：App 进程一启动就监听 127.0.0.1:9091，不依赖 Activity / VPN 已连 -->
+        <service
+            android:name=".api.ApiControlService"
+            android:exported="false"
+            android:label="CMFA API Control"
+            android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="explanation_for_special_use"/>
+        </service>
+        <receiver
+            android:name=".api.ApiBootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
         <service
             android:name=".LogcatService"
