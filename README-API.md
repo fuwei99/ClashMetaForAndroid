@@ -74,14 +74,14 @@ workspace (proot)  ──127.0.0.1:9091──►  ApiControlService (App 主进�
 2. 之后 9091 立即就绪，不需要 App 在前台、不需要 VPN 已连：
 
 ```bash
-cc hello
-cc status
-cc sub 'https://你的订阅链接' 我的订阅 720
-cc on
-cc groups
-cc use GLOBAL 节点名
-cc mode rule
-cc clash /connections          # 裸透传，自动带密
+cmfa hello
+cmfa status
+cmfa sub 'https://你的订阅链接' 我的订阅 720
+cmfa on
+cmfa groups
+cmfa use GLOBAL 节点名
+cmfa mode rule
+cmfa clash /connections          # 裸透传，自动带密
 ```
 
 > 订阅链接别写进任何会被 git / Obsidian / 日志收录的地方。`cc sub` 只从命令行参数读，
