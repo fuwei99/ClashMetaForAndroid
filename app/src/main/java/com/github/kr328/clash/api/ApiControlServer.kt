@@ -34,11 +34,11 @@ import java.util.concurrent.TimeUnit
  * CMFA 合并控制面：App 进程一启动就监听 127.0.0.1:9091。
  *
  * 不是 9090 的简单透传：
- *   - /api/vpn/*      → 直接调 App 自己的 startClashService / stopClashService（真实 VpnService 开关）
+ *   - /api/vpn/...    → 直接调 App 自己的 startClashService / stopClashService（真实 VpnService 开关）
  *   - /api/subscription → 走 IProfileManager 建/拉/激活订阅（真实 App 数据库操作）
  *   - /api/proxy/select → 走 IClashManager.patchSelector（会持久化选中项）
  *   - /api/status     → 一次性合并「App 状态 + 激活配置 + 内核 /version」
- *   - /api/clash/*    → 才是对 mihomo 9090 的代理，且自动注入 Bearer secret（调用方无需知道密钥）
+ *   - /api/clash/...  → 才是对 mihomo 9090 的代理，且自动注入 Bearer secret（调用方无需知道密钥）
  *
  * 端口只绑 loopback；内核 external-controller 强制 127.0.0.1:9090 + 随机 secret + allow-lan:false。
  */
@@ -576,7 +576,7 @@ class ApiControlServer(private val app: Application) {
         val u = java.net.URI(s)
         val host = u.host ?: "?"
         val path = u.path?.take(12) ?: ""
-        "${u.scheme}://$host$path…"
+        "${u.scheme}://${host}${path}…"
     } catch (_: Throwable) {
         "***"
     }
