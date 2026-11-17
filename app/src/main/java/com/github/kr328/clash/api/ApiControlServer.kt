@@ -27,7 +27,11 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 /**
@@ -75,6 +79,13 @@ class ApiControlServer(private val app: Application) {
 
     private var serverSocket: ServerSocket? = null
 
+    // 连接快照缓冲：key = mihomo connection id，value = 最新一次快照（带首见/末见时间）
+    private val historyStore = ConcurrentHashMap<String, JSONObject>()
+    // 被拉黑的 app：同时存包名与 uid 字符串，匹配 metadata.process / metadata.uid 命中即掐
+    private val blocked = ConcurrentHashMap.newKeySet<String>()
+    @Volatile
+    private var lastConns: JSONArray = JSONArray()
+
     fun start() {
         connection.bind()
         thread("cmfa-api-bind") {
@@ -88,6 +99,8 @@ class ApiControlServer(private val app: Application) {
             }
         }
         thread("cmfa-api-accept") { acceptLoop() }
+        // 每 2s 拉一次 /connections：写访问历史 + 持续掐掉被拉黑 app 的新连接
+        thread("cmfa-api-watch") { watchLoop() }
     }
 
     fun stop() {
@@ -216,6 +229,20 @@ class ApiControlServer(private val app: Application) {
             path == "/api/secret" && method == "GET" ->
                 Resp(200, jo("ok" to true, "core_secret" to secret, "core_port" to CORE_PORT).toString())
 
+            // ---- 流量可观测 / 精准封杀 ----
+            path == "/api/connections" && method == "GET" -> connectionsRaw()
+            path == "/api/traffic" && method == "GET" -> traffic()
+            path == "/api/apps" && method == "GET" -> apps(query)
+            path == "/api/history" && method == "GET" -> history(query)
+            path == "/api/history/clear" && method == "POST" -> historyClear()
+            path == "/api/app/kill" && method == "POST" -> appKill(body)
+            path == "/api/app/block" && method == "POST" -> appBlock(body, true)
+            path == "/api/app/unblock" && method == "POST" -> appBlock(body, false)
+            path == "/api/blocks" && method == "GET" ->
+                Resp(200, jo("ok" to true, "blocked" to JSONArray(blocked.sorted())).toString())
+            path == "/api/capture" && method == "GET" -> captureInfo()
+            path == "/api/capture/http" && method == "POST" -> captureHttp(body)
+
             path == "/api/vpn/start" && method == "POST" -> vpnStart()
             path == "/api/vpn/stop" && method == "POST" -> vpnStop()
             path == "/api/vpn/toggle" && method == "POST" -> if (isRunning()) vpnStop() else vpnStart()
@@ -279,6 +306,15 @@ class ApiControlServer(private val app: Application) {
             put("POST /api/controller/inject   重注入 9090 密钥")
             put("ANY  /api/clash/{path}     代理 mihomo 9090（自动带 Bearer）")
             put("GET  /api/token / POST /api/token   可选鉴权")
+            put("GET  /api/connections     内核实时连接原始快照")
+            put("GET  /api/traffic         按 app 聚合：连接数/上下行/访问域名")
+            put("GET  /api/apps            uid 到包名/应用名映射")
+            put("GET  /api/history        访问历史（域名级 URL + app + 字节）")
+            put("POST /api/history/clear  清空历史")
+            put("POST /api/app/kill {package}   立刻掐该 app 现有连接")
+            put("POST /api/app/block|unblock {package}   持续封杀/解封")
+            put("GET  /api/blocks / GET /api/capture   名单 / 抓包能力边界")
+            put("POST /api/capture/http {enable,port}  可选：开本地 HTTP 明文代理（URL/Header 可见）")
         },
     ).toString())
 
@@ -315,6 +351,239 @@ class ApiControlServer(private val app: Application) {
         } catch (e: Throwable) {
             err(500, e)
         }
+    }
+
+    // ------------------------------------------------------------ 流量观测 / 精准封杀
+
+    /** 每 2s 拉一次 /connections：写访问历史（域名级 URL）+ 持续掐被拉黑 app 的新连接。 */
+    private fun watchLoop() {
+        while (running) {
+            try {
+                val (code, text) = coreRaw("GET", "/connections", null)
+                if (code in 200..299 && text.isNotEmpty()) {
+                    val arr = try { JSONObject(text).optJSONArray("connections") ?: JSONArray() } catch (_: Throwable) { JSONArray() }
+                    lastConns = arr
+                    val now = System.currentTimeMillis()
+                    val ts = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(now))
+                    for (i in 0 until arr.length()) {
+                        val c = arr.optJSONObject(i) ?: continue
+                        val id = c.optString("id", "")
+                        if (id.isEmpty()) continue
+                        val meta = c.optJSONObject("metadata") ?: JSONObject()
+                        val proc = meta.optString("process", "").ifEmpty { meta.optString("processPath", "") }
+                        val uid = meta.optString("uid", "")
+                        val host = meta.optString("sniffHost", "").ifEmpty { meta.optString("host", "") }
+                        // 访问历史：每个连接 id 一条，含首见/末见/累计字节/域名/协议/规则/链路
+                        val rec = historyStore[id] ?: JSONObject().also {
+                            it.put("id", id)
+                            it.put("first_seen", ts)
+                            it.put("first_seen_ms", now)
+                            it.put("app", proc)
+                            it.put("uid", uid)
+                            it.put("host", host)
+                            it.put("network", meta.optString("network", ""))
+                            it.put("dest_port", meta.optString("destinationPort", ""))
+                            it.put("rule", c.optString("rule", ""))
+                            it.put("chains", c.optJSONArray("chains") ?: JSONArray())
+                            historyStore[id] = it
+                        }
+                        rec.put("last_seen", ts)
+                        rec.put("last_seen_ms", now)
+                        rec.put("upload", c.optLong("upload", 0))
+                        rec.put("download", c.optLong("download", 0))
+                        // 持续封杀：命中包名或 uid 就把这条连接掐掉
+                        if (blocked.isNotEmpty() &&
+                            (blocked.contains(proc) || (uid.isNotEmpty() && blocked.contains(uid)))) {
+                            runCatching { coreRaw("DELETE", "/connections/$id", null) }
+                            rec.put("killed_by_block", true)
+                        }
+                    }
+                    // 防止无限膨胀
+                    if (historyStore.size > 4000) {
+                        val sorted = historyStore.values.sortedBy { it.optLong("first_seen_ms", 0) }
+                        sorted.take(2000).forEach { historyStore.remove(it.optString("id", "")) }
+                    }
+                }
+            } catch (_: Throwable) {
+                // 内核没起来/隧道抽风都正常，下一轮再拉
+            }
+            try { Thread.sleep(2_000) } catch (_: Throwable) { break }
+        }
+    }
+
+    /** 内核实时连接原始快照（仅透传，给排障用）。 */
+    private fun connectionsRaw(): Resp = try {
+        val (code, text) = coreRaw("GET", "/connections", null)
+        Resp(code, if (text.isEmpty()) jo("ok" to false, "error" to "core unreachable").toString() else text)
+    } catch (e: Throwable) {
+        Resp(502, jo("ok" to false, "error" to e.message).toString())
+    }
+
+    /** 按 app 聚合：连接数 / 上下行 / 访问过的域名，一次看清「哪个 app 在出流量」。 */
+    private fun traffic(): Resp {
+        val map = LinkedHashMap<String, JSONObject>()
+        for (i in 0 until lastConns.length()) {
+            val c = lastConns.optJSONObject(i) ?: continue
+            val meta = c.optJSONObject("metadata") ?: JSONObject()
+            val proc = meta.optString("process", "").ifEmpty { meta.optString("uid", "unknown") }
+            val a = map[proc] ?: JSONObject().also {
+                it.put("app", proc)
+                it.put("uid", meta.optString("uid", ""))
+                it.put("connections", 0)
+                it.put("upload", 0L)
+                it.put("download", 0L)
+                it.put("hosts", JSONArray())
+                map[proc] = it
+            }
+            a.put("connections", a.optInt("connections", 0) + 1)
+            a.put("upload", a.optLong("upload", 0) + c.optLong("upload", 0))
+            a.put("download", a.optLong("download", 0) + c.optLong("download", 0))
+            val h = meta.optString("sniffHost", "").ifEmpty { meta.optString("host", "") }
+            if (h.isNotEmpty()) {
+                val hs = a.optJSONArray("hosts")!!
+                var found = false
+                for (k in 0 until hs.length()) if (hs.optString(k) == h) { found = true; break }
+                if (!found) hs.put(h)
+            }
+        }
+        val arr = JSONArray(map.values.sortedByDescending { it.optLong("upload", 0) + it.optLong("download", 0) })
+        return Resp(200, jo("ok" to true, "apps" to arr, "total_connections" to lastConns.length()).toString())
+    }
+
+    /** uid → 包名 / 应用名映射（App 自己的 PackageManager，不靠内核）。 */
+    private fun apps(query: String): Resp {
+        val filter = parseQuery(query)["uid"]?.trim().orEmpty()
+        val arr = JSONArray()
+        return try {
+            val pm = app.packageManager
+            @Suppress("DEPRECATION")
+            for (pi in pm.getInstalledPackages(0)) {
+                val ai = pi.applicationInfo ?: continue
+                val uid = ai.uid.toString()
+                if (filter.isNotEmpty() && uid != filter && !pi.packageName.contains(filter, true)) continue
+                arr.put(jo(
+                    "uid" to uid,
+                    "package" to pi.packageName,
+                    "label" to pm.getApplicationLabel(ai).toString(),
+                    "system" to ((ai.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0),
+                ))
+            }
+            Resp(200, jo("ok" to true, "apps" to arr, "count" to arr.length()).toString())
+        } catch (e: Throwable) {
+            err(500, e)
+        }
+    }
+
+    /** 访问历史：域名级 URL + app + 字节。支持 ?limit=N / ?app=包名 / ?host=关键字。 */
+    private fun history(query: String): Resp {
+        val q = parseQuery(query)
+        val limit = q["limit"]?.toIntOrNull()?.coerceIn(1, 4000) ?: 200
+        val appFilter = q["app"]?.trim().orEmpty()
+        val hostFilter = q["host"]?.trim().orEmpty()
+        val list = historyStore.values.filter {
+            (appFilter.isEmpty() || it.optString("app", "").contains(appFilter, true)) &&
+                (hostFilter.isEmpty() || it.optString("host", "").contains(hostFilter, true))
+        }.sortedByDescending { it.optLong("last_seen_ms", 0) }
+            .take(limit)
+        return Resp(200, jo("ok" to true, "total" to historyStore.size, "shown" to list.size,
+            "records" to JSONArray(list)).toString())
+    }
+
+    private fun historyClear(): Resp {
+        historyStore.clear()
+        return Resp(200, jo("ok" to true, "cleared" to true).toString())
+    }
+
+    /** 立刻掐掉某个 app 的所有现有连接（一次性的，不写黑名单）。 */
+    private fun appKill(body: String): Resp {
+        val o = try { JSONObject(body) } catch (e: Throwable) { return err(400, e) }
+        val target = o.optString("package", "").ifEmpty { o.optString("app", "") }
+        if (target.isBlank()) return Resp(400, jo("ok" to false, "error" to "package/app required").toString())
+        var killed = 0
+        for (i in 0 until lastConns.length()) {
+            val c = lastConns.optJSONObject(i) ?: continue
+            val meta = c.optJSONObject("metadata") ?: continue
+            val proc = meta.optString("process", "")
+            val uid = meta.optString("uid", "")
+            if (proc == target || uid == target || proc.contains(target, true)) {
+                val id = c.optString("id", "")
+                if (id.isNotEmpty()) {
+                    runCatching { coreRaw("DELETE", "/connections/$id", null) }
+                    killed++
+                }
+            }
+        }
+        return Resp(200, jo("ok" to true, "app" to target, "killed" to killed).toString())
+    }
+
+    /** 持续封杀 / 解封：写内存黑名单，watchLoop 每 2s 自动掐新连接。 */
+    private fun appBlock(body: String, on: Boolean): Resp {
+        val o = try { JSONObject(body) } catch (e: Throwable) { return err(400, e) }
+        val target = o.optString("package", "").ifEmpty { o.optString("app", "") }
+        if (target.isBlank()) return Resp(400, jo("ok" to false, "error" to "package/app required").toString())
+        if (on) blocked.add(target) else blocked.remove(target)
+        return Resp(200, jo("ok" to true, "app" to target, "blocked" to on,
+            "blocked_list" to JSONArray(blocked.sorted())).toString())
+    }
+
+    /** 抓包能力边界：不撒谎，说清能拿什么、拿不到什么。 */
+    private fun captureInfo(): Resp = Resp(200, jo(
+        "ok" to true,
+        "reverse_proxy" to false,
+        "note" to "9091 是控制面，不承载流量；数据流在 tun0/内核，本 API 只读连接元数据 + 发指令。",
+        "can" to JSONArray().apply {
+            put("按 app 看实时流量：GET /api/traffic（uid/包名/连接数/上下行/域名）")
+            put("看访问过哪个域名：GET /api/history（host = SNI sniff / HTTP Host，域名级 URL）")
+            put("精准毙掉 app：POST /api/app/kill（掐现有）或 /api/app/block（持续封杀）")
+            put("抓明文 HTTP：POST /api/capture/http 开本地 mixed-port 代理，配 sniffer 后明文 URL/Header 可见")
+        },
+        "cannot" to JSONArray().apply {
+            put("HTTPS 的 path / body / payload：TLS 加密，非 root 无法做 MITM（Android 7+ 不信任用户 CA）")
+            put("小黄鸟式全量抓包：需要系统 CA + 独立 MITM 栈，不是改几行 API 能平替")
+            put("9091 自己当反向代理：不承载流量，只是指挥面")
+        },
+        "https_visibility" to "仅域名（SNI/HTTP CONNECT host），无 path 无 payload",
+    ).toString())
+
+    /** 可选：注入一个本地 mixed-port 代理，给 curl -x / 小黄鸟等工具导流量用。
+     *  开 sniffer 后，明文 HTTP 的完整 URL 与 Header 在内核侧可见；HTTPS 仍只有 CONNECT host。 */
+    private fun captureHttp(body: String): Resp {
+        val o = try { JSONObject(body) } catch (e: Throwable) { return err(400, e) }
+        val enable = o.optBoolean("enable", true)
+        val port = o.optInt("port", 7890)
+        val cm = clashManager() ?: return unavailable()
+        return try {
+            val ov = cm.queryOverride(Clash.OverrideSlot.Persist)
+            ov.mixedPort = if (enable) port else null
+            ov.externalController = "127.0.0.1:$CORE_PORT"
+            ov.secret = secret
+            ov.allowLan = false
+            cm.patchOverride(Clash.OverrideSlot.Persist, ov)
+            Resp(200, jo(
+                "ok" to true,
+                "http_proxy" to if (enable) "127.0.0.1:$port" else JSONObject.NULL,
+                "enabled" to enable,
+                "hint" to if (enable)
+                    "把工具/浏览器代理指到 127.0.0.1:$port；明文 HTTP 可看完整 URL，HTTPS 只有 CONNECT 里的域名"
+                else "已关闭 mixed-port",
+            ).toString())
+        } catch (e: Throwable) {
+            err(500, e)
+        }
+    }
+
+    private fun parseQuery(q: String): Map<String, String> {
+        if (q.isEmpty()) return emptyMap()
+        val m = HashMap<String, String>()
+        for (kv in q.split("&")) {
+            val i = kv.indexOf('=')
+            if (i < 0) continue
+            try {
+                m[java.net.URLDecoder.decode(kv.substring(0, i), "UTF-8")] =
+                    java.net.URLDecoder.decode(kv.substring(i + 1), "UTF-8")
+            } catch (_: Throwable) {}
+        }
+        return m
     }
 
     private fun status(): Resp = Resp(200, merged().toString())

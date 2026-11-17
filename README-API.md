@@ -99,3 +99,41 @@ cmfa clash /connections          # 裸透传，自动带密
 - `/api/vpn/start` 在权限未授予时返回 `409 vpn_permission_required`，不会自己弹 UI（Android 不允许后台弹 VPN 授权）。
 - App 刚起来的 1–2 秒内 `RemoteService` binder 可能没连上，相关端点返回 `503 RemoteService not bound yet`，重试即可。
 - VPN 接管后 proot 出网也走 tun0：R2 / K70 隧道 / ngrok / 飞书 MCP 的域名必须在规则里放行 DIRECT，否则会把自己的同步链路绕死。
+
+
+---
+
+## 流量观测 / 精准封杀（2026-11-17 追加）
+
+> `TunModule.queryUid()` 用 `ConnectivityManager.getConnectionOwnerUid` 把 UID 喂进内核，
+> `AppListCacheModule` 把 uid→包名表推给 `nativeNotifyInstalledAppChanged`，
+> 所以 mihomo `/connections` 每条自带 `metadata.process` / `uid` / `host` / `sniffHost`。
+> **零内核改动，纯 App 层 merge。**
+
+| 方法 | 路径 | 行为 |
+|---|---|---|
+| GET | `/api/connections` | 内核实时连接原始快照 |
+| GET | `/api/traffic` | **按 app 聚合**：连接数 / 上下行 / 访问过的域名 → 一眼看清哪个 app 在出流量 |
+| GET | `/api/apps?uid=` | uid → 包名 / 应用名 / 是否系统 app |
+| GET | `/api/history?limit=200&app=&host=` | **访问历史**：域名级 URL + app + 字节 + 首见/末见 + 规则链 |
+| POST | `/api/history/clear` | 清空历史 |
+| POST | `/api/app/kill` | `{"package":"..."}` 立刻掐该 app 所有现有连接 |
+| POST | `/api/app/block` / `unblock` | 持续封杀 / 解封（黑名单常驻内存，watchLoop 每 2s 自动掐新连接） |
+| GET | `/api/blocks` | 当前黑名单 |
+| GET | `/api/capture` | **抓包能力边界说明**（不撒谎） |
+| POST | `/api/capture/http` | `{"enable":true,"port":7890}` 可选开本地 mixed-port 代理，明文 HTTP 完整 URL/Header 可见 |
+
+```bash
+cmfa traffic                    # 哪个 app 在出流量
+cmfa history 100 com.tencent.mm # 微信访问过哪些域名
+cmfa kill com.tencent.mm        # 当场掐
+cmfa block com.tencent.mm       # 持续封杀
+cmfa caphttp on 7890            # 开明文代理给工具导流量
+```
+
+### 抓包边界（必读，别装完骂人）
+
+- **9091 是控制面，不承载流量**，不能当反向代理；数据流在 tun0/内核，API 只读连接元数据 + 发指令。
+- **能拿**：按 app 的实时流量统计、访问过的**域名级 URL**（SNI sniff / HTTP Host / CONNECT host）、精准掐连接。
+- **拿不到**：HTTPS 的 path / body / payload —— TLS 加密，非 root 做不了 MITM（Android 7+ 其他 App 不信任用户 CA，小黄鸟那套要系统 CA + 独立 MITM 栈）。
+- 明文 HTTP 想看完整 URL，用 `/api/capture/http` 开 mixed-port 把流量导过去；HTTPS 仍只有域名。
