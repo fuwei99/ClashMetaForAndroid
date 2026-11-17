@@ -82,7 +82,8 @@ class ApiControlServer(private val app: Application) {
     // 连接快照缓冲：key = mihomo connection id，value = 最新一次快照（带首见/末见时间）
     private val historyStore = ConcurrentHashMap<String, JSONObject>()
     // 被拉黑的 app：同时存包名与 uid 字符串，匹配 metadata.process / metadata.uid 命中即掐
-    private val blocked = ConcurrentHashMap.newKeySet<String>()
+    // newKeySet() 要 API 24，本仓 minSdk=21；用 newSetFromMap 兼容到 API 1
+    private val blocked = java.util.Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
     @Volatile
     private var lastConns: JSONArray = JSONArray()
 
