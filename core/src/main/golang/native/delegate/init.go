@@ -42,6 +42,12 @@ func Init(home, versionName, gitVersion string, platformVersion int) {
 		uid := app.QuerySocketUid(metadata.RawSrcAddr, metadata.RawDstAddr)
 		pkg := app.QueryAppByUid(uid)
 
+		// CMFA 分支只写 metadata.Process 不写 Uid（见 mihomo tunnel.go:375-382），
+		// 这里补写 uid，让 /connections 的 uid 字段不再是 0，供 /api/traffic 聚合。
+		if uid > 0 {
+			metadata.Uid = uint32(uid)
+		}
+
 		log.Debugln("[PKG] %s --> %s by %d[%s]", metadata.SourceAddress(), metadata.RemoteAddress(), uid, pkg)
 
 		return pkg, nil

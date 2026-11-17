@@ -4,7 +4,7 @@ import android.app.Application
 import android.content.Context
 import android.net.VpnService
 import com.github.kr328.clash.common.log.Log
-import com.github.kr328.clash.core.Clash
+import com.github.kr328.clash.core.model.ConfigurationOverride
 import com.github.kr328.clash.design.store.UiStore
 import com.github.kr328.clash.remote.Service as RemoteServiceConnection
 import com.github.kr328.clash.remote.StatusClient
@@ -243,6 +243,11 @@ class ApiControlServer(private val app: Application) {
                 Resp(200, jo("ok" to true, "blocked" to JSONArray(blocked.sorted())).toString())
             path == "/api/capture" && method == "GET" -> captureInfo()
             path == "/api/capture/http" && method == "POST" -> captureHttp(body)
+            path == "/api/observe" && method == "GET" -> observeInfo()
+            path == "/api/observe" && method == "POST" -> observeSet(body)
+            path == "/api/group/nodes" && method == "GET" -> groupNodes(query)
+            path == "/api/subscription/import" && method == "POST" -> configImport(body)
+            path.startsWith("/_raw/") && method == "GET" -> rawConfig(path)
 
             path == "/api/vpn/start" && method == "POST" -> vpnStart()
             path == "/api/vpn/stop" && method == "POST" -> vpnStop()
@@ -316,6 +321,9 @@ class ApiControlServer(private val app: Application) {
             put("POST /api/app/block|unblock {package}   持续封杀/解封")
             put("GET  /api/blocks / GET /api/capture   名单 / 抓包能力边界")
             put("POST /api/capture/http {enable,port}  可选：开本地 HTTP 明文代理（URL/Header 可见）")
+            put("GET|POST /api/observe {find_process}  流量观测开关（always 才能拿到 uid/包名）")
+            put("GET  /api/group/nodes?group=  列组内节点 + 当前选中 + 延迟")
+            put("POST /api/subscription/import {yaml,name}  直接导入配置文本（非订阅链接）")
         },
     ).toString())
 
@@ -573,6 +581,107 @@ class ApiControlServer(private val app: Application) {
         }
     }
 
+    /** 流量观测开关：GET 看状态，POST {"find_process":"always|strict"} 切换。
+     *  改 override 会发 ACTION_OVERRIDE_CHANGED → ConfigurationModule 自动重载内核，无需重启 VPN。 */
+    private fun observeInfo(): Resp {
+        val (code, text) = try { coreRaw("GET", "/configs", null) } catch (_: Throwable) { 502 to "" }
+        val cur = try { JSONObject(text).optString("find-process-mode", "unknown") } catch (_: Throwable) { "unknown" }
+        return Resp(200, jo(
+            "ok" to true,
+            "find_process_pref" to if (findProcessAlways()) "always" else "strict",
+            "find_process_core" to cur,
+            "hint" to "always 才会对每条连接解析 uid/包名；strict 仅在命中 PROCESS 规则时解析",
+        ).toString())
+    }
+
+    private fun observeSet(body: String): Resp {
+        val o = try { JSONObject(body) } catch (e: Throwable) { return err(400, e) }
+        val v = o.optString("find_process", "").ifEmpty { o.optString("mode", "") }
+        if (v !in setOf("always", "strict", "off"))
+            return Resp(400, jo("ok" to false, "error" to "find_process must be always|strict|off").toString())
+        val always = v == "always"
+        prefs.edit().putBoolean("find_process_always", always).apply()
+        injectController()   // 重载内核使生效
+        return Resp(200, jo(
+            "ok" to true,
+            "find_process" to v,
+            "note" to "override 已写入，ConfigurationModule 会自动重载内核；新连接即可带包名/uid",
+        ).toString())
+    }
+
+    /** 列组内节点：当前选中 + 节点名 + 类型 + 延迟（走 App 的 queryProxyGroup，非裸透传）。 */
+    private fun groupNodes(query: String): Resp {
+        val q = parseQuery(query)
+        val name = q["group"]?.trim().orEmpty()
+        val cm = clashManager() ?: return unavailable()
+        return try {
+            if (name.isBlank()) {
+                // 不指定组就只列组名（和 /api/groups 一致，省一次往返）
+                val gs = JSONArray()
+                cm.queryProxyGroupNames(false).forEach { gs.put(it) }
+                return Resp(200, jo("ok" to true, "groups" to gs).toString())
+            }
+            val g = cm.queryProxyGroup(name, com.github.kr328.clash.core.model.ProxySort.Default)
+            val arr = JSONArray()
+            g.proxies.forEach { p ->
+                arr.put(jo(
+                    "name" to p.name,
+                    "type" to p.type,
+                    "delay" to p.delay,
+                    "selected" to (p.name == g.now),
+                    "is_group" to p.isGroup,
+                ))
+            }
+            Resp(200, jo("ok" to true, "group" to name, "type" to g.type,
+                "now" to g.now, "count" to arr.length(), "nodes" to arr,
+                "hint" to "选节点：cmfa use \"$name\" \"<节点名>\"").toString())
+        } catch (e: Throwable) {
+            err(500, e)
+        }
+    }
+
+    /** 一次性本地 HTTP 源：给 configImport 里的 Url profile 提供 YAML 文本。
+     *  token 随机、只存活到本次导入结束；不落盘、不写日志、不进 profiles 历史。 */
+    private val rawStore = ConcurrentHashMap<String, String>()
+
+    private fun rawConfig(path: String): Resp {
+        val id = path.removePrefix("/_raw/")
+        val text = rawStore.remove(id)
+            ?: return Resp(404, jo("ok" to false, "error" to "raw config not found").toString())
+        return Resp(200, text, "text/yaml; charset=utf-8")
+    }
+
+    /** 直接贴 YAML / 配置文本导入（非订阅链接）：
+     *  建一个指向 _raw 的 Url profile → CMFA 原生 fetchAndValid 拉文本 → 校验 → 激活。 */
+    private fun configImport(body: String): Resp {
+        val o = try { JSONObject(body) } catch (e: Throwable) { return err(400, e) }
+        val yaml = o.optString("yaml", "").ifEmpty { o.optString("config", "") }
+        if (yaml.isBlank()) return Resp(400, jo("ok" to false, "error" to "yaml/config required").toString())
+        val name = o.optString("name", "API 导入配置")
+        val activate = o.optBoolean("activate", true)
+        val pm = profileManager() ?: return unavailable()
+        val id = UUID.randomUUID().toString()
+        rawStore[id] = yaml
+        val src = "http://127.0.0.1:$PORT/_raw/$id"
+        return try {
+            val uuid = runBlocking(Dispatchers.IO) {
+                val u = pm.create(Profile.Type.Url, name, src, null)
+                pm.patch(u, name, src, 0L, null)
+                pm.commit(u, null)
+                if (activate) pm.queryByUUID(u)?.let { pm.setActive(it) }
+                u
+            }
+            rawStore.remove(id)
+            injectController()
+            Resp(200, jo("ok" to true, "uuid" to uuid.toString(),
+                "name" to name, "bytes" to yaml.toByteArray(Charsets.UTF_8).size,
+                "status" to merged()).toString())
+        } catch (e: Throwable) {
+            rawStore.remove(id)
+            err(502, e)
+        }
+    }
+
     private fun parseQuery(q: String): Map<String, String> {
         if (q.isEmpty()) return emptyMap()
         val m = HashMap<String, String>()
@@ -739,7 +848,11 @@ class ApiControlServer(private val app: Application) {
 
     // ------------------------------------------------------------ 内核控制器注入
 
-    /** 把 external-controller 强制成 127.0.0.1:9090 + 随机 secret；allow-lan 恒 false。 */
+    /** 流量观测开关：默认开。always 才能让 mihomo 每条连接都解析包名/uid；strict 只在命中 PROCESS 规则时解析。 */
+    private fun findProcessAlways(): Boolean = prefs.getBoolean("find_process_always", true)
+
+    /** 把 external-controller 强制成 127.0.0.1:9090 + 随机 secret；allow-lan 恒 false；
+     *  同时按观测开关注入 find-process-mode（改 override 会触发 ConfigurationModule 自动重载内核）。 */
     private fun injectController() {
         val cm = clashManager() ?: return
         try {
@@ -747,8 +860,12 @@ class ApiControlServer(private val app: Application) {
             ov.externalController = "127.0.0.1:$CORE_PORT"
             ov.secret = secret
             ov.allowLan = false
+            ov.findProcessMode = if (findProcessAlways())
+                ConfigurationOverride.FindProcessMode.Always
+            else
+                ConfigurationOverride.FindProcessMode.Strict
             cm.patchOverride(Clash.OverrideSlot.Persist, ov)
-            Log.d("CMFA API: external-controller injected")
+            Log.d("CMFA API: override injected (find-process=${if (findProcessAlways()) "always" else "strict"})")
         } catch (e: Throwable) {
             Log.w("CMFA API inject failed: ${e.message}")
         }

@@ -137,3 +137,47 @@ cmfa caphttp on 7890            # 开明文代理给工具导流量
 - **能拿**：按 app 的实时流量统计、访问过的**域名级 URL**（SNI sniff / HTTP Host / CONNECT host）、精准掐连接。
 - **拿不到**：HTTPS 的 path / body / payload —— TLS 加密，非 root 做不了 MITM（Android 7+ 其他 App 不信任用户 CA，小黄鸟那套要系统 CA + 独立 MITM 栈）。
 - 明文 HTTP 想看完整 URL，用 `/api/capture/http` 开 mixed-port 把流量导过去；HTTPS 仍只有域名。
+
+
+---
+
+## v2：按 app 流量观测修复 + 订阅/节点补齐（2026-11-17 晚）
+
+### 根因（run#4 实测发现的残废点）
+`/connections` 里 `uid` 全 0、`process` 全空 → `/api/traffic` 把流量全糊成 `app="0"`。
+- mihomo `tunnel.go:400-405`：`find-process-mode: strict` 只在规则命中 PROCESS 时才调 `DefaultPackageNameResolver`；
+  CMFA 默认 strict，普通规则永不解析。
+- `tunnel.go:375-382` 的 CMFA 分支只写 `metadata.Process`、**不写 `metadata.Uid`**。
+
+### 修复
+- `injectController()` 按开关注入 `find-process-mode: always`（默认开）。改 override 会发
+  `ACTION_OVERRIDE_CHANGED` → `ConfigurationModule` 自动 `Clash.load()` 重载，无需重启 VPN。
+  `PATCH /configs` 改这个字段是 405，必须走 override。
+- `delegate/init.go` 的 resolver 补写 `metadata.Uid = uint32(uid)`。
+- `GET|POST /api/observe`：`{"find_process":"always|strict|off"}` 开关（always 有每连接反查开销，留退路）。
+
+### 订阅 / 节点（链接导入首版就有，补齐「列节点」与「贴文本」）
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/subscription` | `{"url","name","interval_min","activate"}` 建/拉/激活订阅链接 |
+| POST | `/api/subscription/refresh` | 刷新当前订阅 |
+| GET | `/api/profiles` / DELETE `/api/profiles/{uuid}` | 配置列表 / 删除 |
+| GET | `/api/groups` | 组名列表 |
+| **GET** | **`/api/group/nodes?group=xxx`** | **组内节点 + 当前选中 + 延迟**（走 `queryProxyGroup`，非透传） |
+| POST | `/api/proxy/select` | `{"group","name"}` 选节点，写 `SelectionDao` 持久化 |
+| POST | `/api/mode` | `{"mode":"rule|global|direct"}` |
+| **POST** | **`/api/subscription/import`** | **`{"yaml","name"}` 直接贴配置文本**：API 起一次性 `_raw/<uuid>` HTTP 源喂给 Url profile，走原生 `fetchAndValid` 校验+激活，不落盘不写日志 |
+
+```bash
+cmfa observe                  # 看 find-process-mode
+cmfa observe always           # 开按 app 观测（默认已开）
+cmfa traffic                  # 现在能看到具体包名了
+cmfa nodes "🚀节点选择"        # 列节点 + 当前选中
+cmfa use "🚀节点选择" "🇯🇵日本节点 01"
+cmfa sub https://xxx/xxx 我的订阅 720   # 链接导入
+cmfa import ./config.yaml 我的配置       # 贴 YAML 导入
+cmfa groups / profiles / refresh / rm / mode / inject / secret
+```
+
+> 装新包后需手动开一次 App 授 VPN；刚起时 binder 未连返回 503，等 1-2s 重试。
+> 首次 `cmfa observe` 若 `find_process_core` 仍是 strict，手动 `cmfa observe always` 触发一次重载。
