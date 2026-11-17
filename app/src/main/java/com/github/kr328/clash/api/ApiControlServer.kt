@@ -88,6 +88,60 @@ class ApiControlServer(private val app: Application) {
     @Volatile
     private var lastConns: JSONArray = JSONArray()
 
+    // uid → 包名缓存：mihomo CMFA 分支只写 metadata.Process 不写 Uid 之外的包名，
+    // 实测 process 恒空但 uid 有效，故用 PackageManager 反查，供 traffic/history/kill/block 统一使用。
+    private val uidPkg = ConcurrentHashMap<String, String>()
+    private val pkgUid = ConcurrentHashMap<String, String>()
+    @Volatile
+    private var uidPkgLoadedAt = 0L
+
+    /** 30s 刷新一次 uid↔包名表（getInstalledPackages 有一定开销，别每条连接都扫）。 */
+    private fun ensureUidMap() {
+        val now = System.currentTimeMillis()
+        if (now - uidPkgLoadedAt < 30_000 && uidPkg.isNotEmpty()) return
+        try {
+            val pm = app.packageManager
+            @Suppress("DEPRECATION")
+            val list = pm.getInstalledPackages(0)
+            val u2p = HashMap<String, String>(list.size)
+            val p2u = HashMap<String, String>(list.size)
+            for (pi in list) {
+                val ai = pi.applicationInfo ?: continue
+                val u = ai.uid.toString()
+                // 同一个 uid 可能被多个包共享，优先保留先出现的（与 AppListCacheModule 一致）
+                if (!u2p.containsKey(u)) u2p[u] = pi.packageName
+                p2u[pi.packageName] = u
+            }
+            uidPkg.clear(); uidPkg.putAll(u2p)
+            pkgUid.clear(); pkgUid.putAll(p2u)
+            uidPkgLoadedAt = now
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** 内核 process 为空时用 uid 反查包名；再不行退回 uid（至少不是空串）。 */
+    private fun resolveApp(proc: String, uid: String): String {
+        if (proc.isNotEmpty()) return proc
+        if (uid.isNotEmpty() && uid != "0") {
+            ensureUidMap()
+            uidPkg[uid]?.let { return it }
+        }
+        return uid
+    }
+
+    /** 统一匹配：支持传包名 / uid / 应用名关键字，命中即真能掐到连接。 */
+    private fun matchApp(target: String, proc: String, uid: String): Boolean {
+        if (target.isBlank()) return false
+        val resolved = resolveApp(proc, uid)
+        if (resolved == target || uid == target || proc == target) return true
+        if (resolved.contains(target, true) || proc.contains(target, true)) return true
+        // 传的是 uid 但连接里只有包名，或反过来
+        ensureUidMap()
+        pkgUid[target]?.let { if (it == uid) return true }
+        uidPkg[uid]?.let { if (it == target) return true }
+        return false
+    }
+
     fun start() {
         connection.bind()
         thread("cmfa-api-bind") {
@@ -380,8 +434,9 @@ class ApiControlServer(private val app: Application) {
                         val id = c.optString("id", "")
                         if (id.isEmpty()) continue
                         val meta = c.optJSONObject("metadata") ?: JSONObject()
-                        val proc = meta.optString("process", "").ifEmpty { meta.optString("processPath", "") }
+                        val rawProc = meta.optString("process", "").ifEmpty { meta.optString("processPath", "") }
                         val uid = meta.optString("uid", "")
+                        val proc = resolveApp(rawProc, uid)
                         val host = meta.optString("sniffHost", "").ifEmpty { meta.optString("host", "") }
                         // 访问历史：每个连接 id 一条，含首见/末见/累计字节/域名/协议/规则/链路
                         val rec = historyStore[id] ?: JSONObject().also {
@@ -403,7 +458,7 @@ class ApiControlServer(private val app: Application) {
                         rec.put("download", c.optLong("download", 0))
                         // 持续封杀：命中包名或 uid 就把这条连接掐掉
                         if (blocked.isNotEmpty() &&
-                            (blocked.contains(proc) || (uid.isNotEmpty() && blocked.contains(uid)))) {
+                            blocked.any { matchApp(it, proc, uid) }) {
                             runCatching { coreRaw("DELETE", "/connections/$id", null) }
                             rec.put("killed_by_block", true)
                         }
@@ -435,10 +490,11 @@ class ApiControlServer(private val app: Application) {
         for (i in 0 until lastConns.length()) {
             val c = lastConns.optJSONObject(i) ?: continue
             val meta = c.optJSONObject("metadata") ?: JSONObject()
-            val proc = meta.optString("process", "").ifEmpty { meta.optString("uid", "unknown") }
+            val uid = meta.optString("uid", "")
+            val proc = resolveApp(meta.optString("process", "").ifEmpty { meta.optString("processPath", "") }, uid)
             val a = map[proc] ?: JSONObject().also {
                 it.put("app", proc)
-                it.put("uid", meta.optString("uid", ""))
+                it.put("uid", uid)
                 it.put("connections", 0)
                 it.put("upload", 0L)
                 it.put("download", 0L)
@@ -491,7 +547,10 @@ class ApiControlServer(private val app: Application) {
         val appFilter = q["app"]?.trim().orEmpty()
         val hostFilter = q["host"]?.trim().orEmpty()
         val list = historyStore.values.filter {
-            (appFilter.isEmpty() || it.optString("app", "").contains(appFilter, true)) &&
+            val recApp = it.optString("app", "")
+            val recUid = it.optString("uid", "")
+            (appFilter.isEmpty() || recApp.contains(appFilter, true) ||
+                recUid == appFilter || resolveApp("", recUid).contains(appFilter, true)) &&
                 (hostFilter.isEmpty() || it.optString("host", "").contains(hostFilter, true))
         }.sortedByDescending { it.optLong("last_seen_ms", 0) }
             .take(limit)
@@ -515,7 +574,7 @@ class ApiControlServer(private val app: Application) {
             val meta = c.optJSONObject("metadata") ?: continue
             val proc = meta.optString("process", "")
             val uid = meta.optString("uid", "")
-            if (proc == target || uid == target || proc.contains(target, true)) {
+            if (matchApp(target, proc, uid)) {
                 val id = c.optString("id", "")
                 if (id.isNotEmpty()) {
                     runCatching { coreRaw("DELETE", "/connections/$id", null) }
@@ -664,9 +723,11 @@ class ApiControlServer(private val app: Application) {
         val id = UUID.randomUUID().toString()
         rawStore[id] = yaml
         val src = "http://127.0.0.1:$PORT/_raw/$id"
+        var createdUuid: UUID? = null
         return try {
             val uuid = runBlocking(Dispatchers.IO) {
                 val u = pm.create(Profile.Type.Url, name, src, null)
+                createdUuid = u
                 pm.patch(u, name, src, 0L, null)
                 pm.commit(u, null)
                 if (activate) pm.queryByUUID(u)?.let { pm.setActive(it) }
@@ -679,6 +740,10 @@ class ApiControlServer(private val app: Application) {
                 "status" to merged()).toString())
         } catch (e: Throwable) {
             rawStore.remove(id)
+            // commit/fetchAndValid 失败会留下 pending=true 的脏 profile，必须回滚
+            createdUuid?.let {
+                runCatching { runBlocking(Dispatchers.IO) { pm.delete(it) } }
+            }
             err(502, e)
         }
     }
