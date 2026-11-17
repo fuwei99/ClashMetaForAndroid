@@ -181,3 +181,24 @@ cmfa groups / profiles / refresh / rm / mode / inject / secret
 
 > 装新包后需手动开一次 App 授 VPN；刚起时 binder 未连返回 503，等 1-2s 重试。
 > 首次 `cmfa observe` 若 `find_process_core` 仍是 strict，手动 `cmfa observe always` 触发一次重载。
+
+---
+
+## 固定签名 Release（2026-11-17 晚）
+
+之前 `build-debug.yaml` 的签名段被注释 → 回退到 debug 签名，每次包签名随 runner 变，
+导致覆盖安装报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`。现已改成**固定签名**：
+
+- 私钥由本地生成，PKCS12 / RSA2048 / 30 年，别名 `cmfa-release`，
+  证书 SHA-256 `46:7E:50:F0:41:97:9D:4D:F9:CF:E6:36:66:B1:73:DE:12:C3:CB:43:9F:FF:55:FE:89:48:79:A6:5F:5D:B7:28`。
+- 私钥**绝不进仓库**（public）：CI 由 Actions Secret `KEYSTORE_BASE64` 现场解码成
+  `release.keystore`，配合 `SIGNING_STORE_PASSWORD` / `SIGNING_KEY_ALIAS` /
+  `SIGNING_KEY_PASSWORD` 生成 `signing.properties`，`build.gradle.kts` 原有
+  `signingConfigs.release` 直接生效。缺 secret 会 `::error::` 直接失败，拒绝用 debug 签名出包。
+- 加密备份：`/mnt/obsidian/临时传递文件/signing/cmfa-release-keystore-20261117.enc`
+  （`openssl enc -aes-256-cbc -pbkdf2`，口令 `OBSIDIAN_MASTER_KEY`），已回读校验。
+- 保持 **alpha flavor**（applicationId 带 `.alpha`），绝不换 meta，否则变成另一个 App 无法覆盖。
+- artifact 名从 "CMFA Debug Unsigned APK" 改为 **"CMFA Signed Release APK"**。
+
+> ⚠️ 手机上现装的旧 unsigned 包签名不同，**本次仍需卸载一次**；之后所有 CI 包签名一致，
+> 直接覆盖升级即可，不用再卸。

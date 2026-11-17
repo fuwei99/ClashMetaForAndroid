@@ -1,4 +1,4 @@
-name: Build Debug
+name: Build Signed Release
 on:
   pull_request:
     types: [opened, reopened, synchronize]
@@ -52,21 +52,28 @@ jobs:
           sudo update-ca-certificates
           cp -f /etc/ssl/certs/ca-certificates.crt core/src/foss/golang/clash/component/ca/ca-certificates.crt
 
-      # - name: Signing properties
-      #   env:
-      #     SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
-      #     SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
-      #     SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
-      #   run: |
-      #     touch signing.properties
-      #     echo keystore.password="$SIGNING_STORE_PASSWORD" > signing.properties
-      #     echo key.alias="$SIGNING_KEY_ALIAS" >> signing.properties
-      #     echo key.password="$SIGNING_KEY_PASSWORD" >> signing.properties
-            
-      #     echo "cat signing.properties"
-      #     cat signing.properties
-
-      - name: Build
+      - name: Prepare fixed signing (Actions Secrets)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::KEYSTORE_BASE64 secret 缺失，拒绝用 debug 签名出包"
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > release.keystore
+          chmod 600 release.keystore
+          printf 'keystore.password=%s\n' "$SIGNING_STORE_PASSWORD"  > signing.properties
+          printf 'key.alias=%s\n'          "$SIGNING_KEY_ALIAS"      >> signing.properties
+          printf 'key.password=%s\n'       "$SIGNING_KEY_PASSWORD"   >> signing.properties
+          echo "签名证书指纹（固定不变）:"
+          keytool -list -v -keystore release.keystore \
+            -storepass "$SIGNING_STORE_PASSWORD" -alias "$SIGNING_KEY_ALIAS" 2>/dev/null \
+            | grep -i 'SHA256:' | head -1
+      
+      - name: Build (signed AlphaRelease)
         if: success()
         run: ./gradlew --no-daemon app:assembleAlphaRelease
           
@@ -74,7 +81,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: ${{  success() }}
         with:
-          name: CMFA Debug Unsigned APK (universal) 
+          name: CMFA Signed Release APK (universal)
           path: |
             app/build/outputs/apk/alpha/release/*-universal-*.apk
       
@@ -82,7 +89,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: ${{  success() }}
         with:
-          name: CMFA Debug Unsigned APK (arm64-v8a)
+          name: CMFA Signed Release APK (arm64-v8a)
           path: |
             app/build/outputs/apk/alpha/release/*-arm64-v8a-*.apk
       
@@ -90,7 +97,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: ${{  success() }}
         with:
-          name: CMFA Debug Unsigned APK (armeabi-v7a)
+          name: CMFA Signed Release APK (armeabi-v7a)
           path: |
             app/build/outputs/apk/alpha/release/*-armeabi-v7a-*.apk
       
@@ -98,7 +105,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: ${{  success() }}
         with:
-          name: CMFA Debug Unsigned APK (x86_64)
+          name: CMFA Signed Release APK (x86_64)
           path: |
             app/build/outputs/apk/alpha/release/*-x86_64-*.apk
       
@@ -106,6 +113,6 @@ jobs:
         uses: actions/upload-artifact@v7
         if: ${{  success() }}
         with:
-          name: CMFA Debug Unsigned APK (x86)
+          name: CMFA Signed Release APK (x86)
           path: |
             app/build/outputs/apk/alpha/release/*-x86-*.apk

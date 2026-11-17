@@ -64,3 +64,8 @@ google-services.json
 
 # MacOS
 .DS_Store
+
+# 固定签名私钥：CI 由 KEYSTORE_BASE64 secret 现场解码，本地不落仓库
+release.keystore
+*.keystore
+signing.properties

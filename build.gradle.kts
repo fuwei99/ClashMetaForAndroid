@@ -152,6 +152,7 @@ subprojects {
                     }
 
                     storeFile = rootProject.file("release.keystore")
+                    storeType = "PKCS12"
                     storePassword = prop.getProperty("keystore.password")!!
                     keyAlias = prop.getProperty("key.alias")!!
                     keyPassword = prop.getProperty("key.password")!!
