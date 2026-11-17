@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/dlclark/regexp2"
+	"strconv"
 
 	"cfa/native/common"
 
@@ -19,6 +20,7 @@ import (
 var processors = []processor{
 	patchExternalController, // must before patchOverride, so we only apply ExternalController in Override settings
 	patchOverride,
+	patchDenyRules, // prepend API 封杀规则（须在 patchOverride 之后，读到最新名单）
 	patchGeneral,
 	patchProfile,
 	patchDns,
@@ -26,6 +28,60 @@ var processors = []processor{
 	patchListeners,
 	patchProviders,
 	validConfig,
+}
+
+// patchDenyRules 把 API 的封杀名单转成最前面的 REJECT 规则。
+// 事后 DELETE /connections 只能断已建连接，App 秒重连照样刷；
+// 规则层 PROCESS-NAME / UID REJECT 在连接建立瞬间就拒，才是真的掐死。
+func patchDenyRules(cfg *config.RawConfig, _ string) error {
+	deny := readDenyPackages()
+	if len(deny) == 0 {
+		return nil
+	}
+
+	prepended := make([]string, 0, len(deny)*2)
+	for _, item := range deny {
+		if item == "" {
+			continue
+		}
+		if _, err := strconv.ParseUint(item, 10, 32); err == nil {
+			prepended = append(prepended, "UID,"+item+",REJECT")
+		} else {
+			prepended = append(prepended, "PROCESS-NAME,"+item+",REJECT")
+		}
+	}
+	if len(prepended) == 0 {
+		return nil
+	}
+
+	cfg.Rule = append(prepended, cfg.Rule...)
+	log.Infoln("patchDenyRules: prepend %d REJECT rules", len(prepended))
+	return nil
+}
+
+type denyOverride struct {
+	DenyPackages []string `json:"api-deny-packages"`
+}
+
+func readDenyPackages() []string {
+	var out []string
+	for _, slot := range []OverrideSlot{OverrideSlotPersist, OverrideSlotSession} {
+		var d denyOverride
+		if err := json.NewDecoder(strings.NewReader(ReadOverride(slot))).Decode(&d); err != nil {
+			continue
+		}
+		out = append(out, d.DenyPackages...)
+	}
+	// 去重
+	seen := map[string]bool{}
+	uniq := make([]string, 0, len(out))
+	for _, p := range out {
+		if p != "" && !seen[p] {
+			seen[p] = true
+			uniq = append(uniq, p)
+		}
+	}
+	return uniq
 }
 
 type processor func(cfg *config.RawConfig, profileDir string) error

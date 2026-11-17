@@ -85,6 +85,13 @@ class ApiControlServer(private val app: Application) {
     // 被拉黑的 app：同时存包名与 uid 字符串，匹配 metadata.process / metadata.uid 命中即掐
     // newKeySet() 要 API 24，本仓 minSdk=21；用 newSetFromMap 兼容到 API 1
     private val blocked = java.util.Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+
+    init {
+        // 重启 App 后恢复封杀名单（规则层 REJECT 靠 override 持久化）
+        runCatching {
+            prefs.getStringSet("deny_packages", null)?.let { blocked.addAll(it) }
+        }
+    }
     @Volatile
     private var lastConns: JSONArray = JSONArray()
 
@@ -585,13 +592,35 @@ class ApiControlServer(private val app: Application) {
         return Resp(200, jo("ok" to true, "app" to target, "killed" to killed).toString())
     }
 
-    /** 持续封杀 / 解封：写内存黑名单，watchLoop 每 2s 自动掐新连接。 */
+    /** 把封杀名单写进 override → patchOverride 发 ACTION_OVERRIDE_CHANGED →
+     *  ConfigurationModule 自动 Clash.load() 重载 → Go patchDenyRules prepend REJECT 规则（事前拒绝）。 */
+    private fun applyDenyRules() {
+        val cm = clashManager() ?: return
+        try {
+            val ov = cm.queryOverride(Clash.OverrideSlot.Persist)
+            ov.externalController = "127.0.0.1:$CORE_PORT"
+            ov.secret = secret
+            ov.allowLan = false
+            ov.denyPackages = blocked.sorted().takeIf { it.isNotEmpty() }
+            cm.patchOverride(Clash.OverrideSlot.Persist, ov)
+            Log.d("CMFA API: deny rules applied (${blocked.size})")
+        } catch (e: Throwable) {
+            Log.w("CMFA API applyDenyRules failed: ${e.message}")
+        }
+    }
+
+    /** 持续封杀 / 解封：规则层 REJECT（事前拒绝） + 内存黑名单（watchLoop 兜底掐漏网连接）。 */
     private fun appBlock(body: String, on: Boolean): Resp {
         val o = try { JSONObject(body) } catch (e: Throwable) { return err(400, e) }
         val target = o.optString("package", "").ifEmpty { o.optString("app", "") }
         if (target.isBlank()) return Resp(400, jo("ok" to false, "error" to "package/app required").toString())
         if (on) blocked.add(target) else blocked.remove(target)
+        prefs.edit().putStringSet("deny_packages", HashSet(blocked)).apply()
+        applyDenyRules()   // 触发内核重载，REJECT 规则立即生效
+        // 顺手把现有连接也断一次（重载前已建的连接规则管不到）
+        if (on) runCatching { appKill(JSONObject().put("package", target).toString()) }
         return Resp(200, jo("ok" to true, "app" to target, "blocked" to on,
+            "enforced_by" to "rule:REJECT (prepend, survives reconnect)",
             "blocked_list" to JSONArray(blocked.sorted())).toString())
     }
 
@@ -930,6 +959,7 @@ class ApiControlServer(private val app: Application) {
                 ConfigurationOverride.FindProcessMode.Always
             else
                 ConfigurationOverride.FindProcessMode.Strict
+            ov.denyPackages = blocked.sorted().takeIf { it.isNotEmpty() }
             cm.patchOverride(Clash.OverrideSlot.Persist, ov)
             Log.d("CMFA API: override injected (find-process=${if (findProcessAlways()) "always" else "strict"})")
         } catch (e: Throwable) {

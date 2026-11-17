@@ -202,3 +202,28 @@ cmfa groups / profiles / refresh / rm / mode / inject / secret
 
 > ⚠️ 手机上现装的旧 unsigned 包签名不同，**本次仍需卸载一次**；之后所有 CI 包签名一致，
 > 直接覆盖升级即可，不用再卸。
+
+---
+
+## v3：封杀改成规则层 REJECT（2026-11-17 夜）
+
+用户实测：v2 的 `block` 只是每 2s `DELETE /connections`，`killed_by_block` 一路涨到 146，
+**小红书照样能刷，只是慢一丢丢** —— 事后断连接，App 秒重连钻窗口，那叫减速带不叫封杀。
+
+查证：`/rules` 只读不能动态加规则；`PUT /configs` 整份 payload 会绕过 CMFA 的 tun/dns
+processor 把 VPN 搞挂。正解是配置层 prepend 规则：
+
+- `ConfigurationOverride` 加 `api-deny-packages`（`@SerialName`）。
+- `appBlock/unblock` 把名单写进 override → `patchOverride` 发 `ACTION_OVERRIDE_CHANGED`
+  → `ConfigurationModule` 自动 `Clash.load()` 重载内核。
+- Go `config/process.go` 新增 `patchDenyRules`（在 processors 链里 `patchOverride` 之后）：
+  读 `api-deny-packages`，prepend `PROCESS-NAME,<pkg>,REJECT`（数字则 `UID,<uid>,REJECT`）
+  到 `cfg.Rule` 最前面。连接建立瞬间就被拒，重连也没用。
+- 名单同时持久化到 prefs，App 重启由 `init{}` 恢复 + `injectController()` 写回 override。
+- `kill` 仍保留即时断连（清掉重载前已建的连接）；watchLoop 继续兜底。
+
+```bash
+cmfa block com.xingin.xhs    # 现在是真的掐死，刷不动
+cmfa unblock com.xingin.xhs  # 解封
+cmfa blocks
+```

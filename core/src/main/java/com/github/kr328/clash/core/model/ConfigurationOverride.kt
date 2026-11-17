@@ -68,6 +68,10 @@ data class ConfigurationOverride(
     @SerialName("find-process-mode")
     var findProcessMode: FindProcessMode? = null,
 
+    // API 封杀名单：Go 侧 patchDenyRules 会把它转成最前面的 PROCESS-NAME/UID REJECT 规则（事前拒绝）
+    @SerialName("api-deny-packages")
+    var denyPackages: List<String>? = null,
+
     @SerialName("dns")
     val dns: Dns = Dns(),
 
