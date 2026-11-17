@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import android.net.VpnService
 import com.github.kr328.clash.common.log.Log
+import com.github.kr328.clash.core.Clash
 import com.github.kr328.clash.core.model.ConfigurationOverride
 import com.github.kr328.clash.design.store.UiStore
 import com.github.kr328.clash.remote.Service as RemoteServiceConnection
