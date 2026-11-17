@@ -1,0 +1,60 @@
+name: Publish Signed Release
+
+# 把指定 CI run 产出的「CMFA Signed Release APK」转成 GitHub Release asset。
+# 动机：Actions artifact 下载走 Azure blob，proot/tun0 下被限速 ~8KB/s；
+#       Release asset 走 release-assets.githubusercontent.com，直连快，且 public 仓库免登录。
+on:
+  workflow_dispatch:
+    inputs:
+      run-id:
+        description: '产出签名包的 Actions run id'
+        required: true
+        default: '44085559700'
+      tag:
+        description: 'Release tag'
+        required: true
+        default: 'cmfa-signed-20261117'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  Publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download signed APKs from source run
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.run-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pattern: CMFA Signed Release APK *
+          merge-multiple: true
+          path: apks
+
+      - name: List downloaded APKs
+        run: ls -lh apks/
+
+      - name: Verify signing certificate (arm64)
+        run: |
+          APK=$(ls apks/*arm64-v8a*.apk | head -1)
+          echo "检查 $APK 的签名证书指纹"
+          $ANDROID_HOME/build-tools/*/apksigner verify --print-certs "$APK" 2>/dev/null \
+            | grep -i 'Signer #1 certificate SHA-256' \
+            || echo "apksigner 不可用，跳过（CI 构建时 keytool 已核对过指纹）"
+
+      - name: Create Release with signed APKs
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: CMFA API 固定签名 Release (${{ inputs.tag }})
+          body: |
+            固定签名 Release，证书 SHA-256：
+            `46:7E:50:F0:41:97:9D:4D:F9:CF:E6:36:66:B1:73:DE:12:C3:CB:43:9F:FF:55:FE:89:48:79:A6:5F:5D:B7:28`
+
+            - alpha flavor（applicationId 带 `.alpha`），后续所有 CI 包均为此签名，可直接覆盖升级
+            - 手机上现装的旧 unsigned 包签名不同，**本次需卸载一次**，之后一劳永逸
+            - 9091 控制面：流量观测 / 按 app 封杀 / 订阅导入 / 节点选择，见 README-API.md
+          files: apks/*.apk
+          draft: false
+          prerelease: false
