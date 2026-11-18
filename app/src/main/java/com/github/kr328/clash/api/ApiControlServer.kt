@@ -316,10 +316,22 @@ class ApiControlServer(private val app: Application) {
             path == "/api/vpn/toggle" && method == "POST" -> if (isRunning()) vpnStop() else vpnStart()
 
             path == "/api/profiles" && method == "GET" -> profiles()
+            path == "/api/profiles/activate" && method == "POST" -> profileActivate(body)
             path.startsWith("/api/profiles/") && method == "DELETE" ->
                 profileDelete(path.removePrefix("/api/profiles/"))
             path == "/api/subscription" && method == "POST" -> subscription(body)
             path == "/api/subscription/refresh" && method == "POST" -> subscriptionRefresh()
+
+            // ---- UI 锁 / 自启（只锁 UI，API 全畅通） ----
+            path == "/api/lock" && method == "GET" -> Resp(200, UiLock.asJson(app).toString())
+            path == "/api/lock" && method == "POST" -> lockSet(body)
+            path == "/api/unlock" && method == "POST" -> {
+                UiLock.clear(app)
+                Resp(200, jo("ok" to true, "unlocked" to true, "lock" to UiLock.asJson(app)).toString())
+            }
+            path == "/api/autostart" && method == "GET" ->
+                Resp(200, jo("ok" to true, "autostart_vpn" to UiLock.autostart(app)).toString())
+            path == "/api/autostart" && method == "POST" -> autostartSet(body)
 
             path == "/api/groups" && method == "GET" -> groups()
             path == "/api/proxy/select" && method == "POST" -> proxySelect(body)
@@ -823,6 +835,7 @@ class ApiControlServer(private val app: Application) {
         }
         j.put("core_reachable", code in 200..299)
         j.put("core_version", if (code in 200..299) text else JSONObject.NULL)
+        j.put("lock", UiLock.asJson(app))
         return j
     }
 
@@ -924,7 +937,51 @@ class ApiControlServer(private val app: Application) {
         }
     }
 
-    /** 合并示例：改内核 mode 后直接回吐合并状态，一次调用拿全。 */
+    /** 切换已有配置为 active（不用重新建 Url profile）。锁了 UI 后靠这个 + API 完成换配置。 */
+    private fun profileActivate(body: String): Resp {
+        val o = try { JSONObject(body) } catch (e: Throwable) { return err(400, e) }
+        val id = o.optString("uuid", "")
+        if (id.isBlank()) return Resp(400, jo("ok" to false, "error" to "uuid required").toString())
+        val pm = profileManager() ?: return unavailable()
+        return try {
+            val uuid = UUID.fromString(id)
+            val profile = runBlocking(Dispatchers.IO) { pm.queryByUUID(uuid) }
+                ?: return Resp(404, jo("ok" to false, "error" to "profile not found").toString())
+            runBlocking(Dispatchers.IO) { pm.setActive(profile) }
+            injectController()
+            Resp(200, jo("ok" to true, "uuid" to id, "name" to profile.name,
+                "status" to merged()).toString())
+        } catch (e: Throwable) {
+            err(400, e)
+        }
+    }
+
+    /** POST /api/lock：整份替换规则（不带 deny = ALL 全锁）。绝不检查当前锁 —— API 永远畅通。 */
+    private fun lockSet(body: String): Resp {
+        val o = try { JSONObject(body) } catch (e: Throwable) { JSONObject() }
+        val arr = o.optJSONArray("deny")
+        val deny: Collection<String> = if (arr == null) {
+            val single = o.optString("deny", "")
+            if (single.isBlank()) listOf("ALL") else listOf(single)
+        } else {
+            (0 until arr.length()).mapNotNull { arr.optString(it, "").takeIf { s -> s.isNotBlank() } }
+        }
+        val applied = UiLock.replace(app, deny)
+        return Resp(200, jo("ok" to true, "mode" to "replace",
+            "applied" to JSONArray(applied.sorted()),
+            "lock" to UiLock.asJson(app)).toString())
+    }
+
+    /** 开机/覆盖装后自动拉起 VPN 的开关。 */
+    private fun autostartSet(body: String): Resp {
+        val o = try { JSONObject(body) } catch (e: Throwable) { return err(400, e) }
+        val on = o.optBoolean("enable", true)
+        UiLock.setAutostart(app, on)
+        return Resp(200, jo("ok" to true, "autostart_vpn" to on,
+            "hint" to "App 进程启动（含开机/覆盖装广播）后自动 startClashService").toString())
+    }
+
+    /** 改内核 mode 后直接回吐合并状态，一次调用拿全。 */
     private fun setMode(body: String): Resp {
         val o = try { JSONObject(body) } catch (e: Throwable) { return err(400, e) }
         val mode = o.optString("mode", "")

@@ -227,3 +227,63 @@ cmfa block com.xingin.xhs    # 现在是真的掐死，刷不动
 cmfa unblock com.xingin.xhs  # 解封
 cmfa blocks
 ```
+
+---
+
+## v4：UI Lock / Autostart（2026-11-18 午）
+
+用户要「锁机」：锁了以后 UI 点不动（尤其不能手滑关 VPN 绕开监督），但
+**切配置/换节点/改规则/开关 VPN 必须全都能走 API**，绝不能两头堵死。
+
+### 语义（用户定的硬规矩）
+- `POST /api/lock` = **整份替换**旧规则，不是叠加；不带 `deny` = `ALL`（最严，整个 UI 点不了）。
+- `POST /api/unlock` = 一键清空全部规则。
+- 只锁 UI 入口；**9091 API 永远不检查锁**。
+- 新增 `POST /api/profiles/activate {"uuid":...}`：在已有配置间切换（补上「锁了 UI 后 API 也能换配置」的缺口）。
+
+### 能力位
+| 位 | 挡什么 |
+|---|---|
+| `ALL` | 所有 Activity（崩溃/损坏提示页除外）+ 主页按钮 + 磁贴 + 快捷方式/外部 Intent |
+| `VPN` | 主页开关、`ExternalControlActivity` 三个 action、QS 磁贴；**API `/api/vpn/*` 不挡** |
+| `PROFILE` | Profiles/NewProfile/Properties 页、外部 ACTION_VIEW 导入 |
+| `PROXY` | Proxy/Providers 页 |
+| `SETTINGS` | 各 Settings/AccessControl 页 |
+| `RULES` | OverrideSettings 页 + 配置页（改规则） |
+
+落点：主进程共享 `api_control` prefs（`UiLock.kt`），`BaseActivity.onCreate` 做全锁/分模块拦截，
+`MainActivity`/`ExternalControlActivity`/`TileService` 拦各自入口；`util/Clash.kt` 公共
+`startClashService()` **不动**，故 API 路径天然畅通。`RestartReceiver` 不拦（它就是自启本身）。
+
+### 端点
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/lock` | 当前规则集 + 各位状态 + autostart |
+| POST | `/api/lock` | `{"deny":["VPN","PROFILE"]}` 整份替换；`{}` = ALL |
+| POST | `/api/unlock` | 清空全部 |
+| GET/POST | `/api/autostart` | `{"enable":true}` 开机/覆盖装后自动拉 VPN |
+| POST | `/api/profiles/activate` | `{"uuid":"..."}` 切已有配置 |
+| GET | `/api/status` | `lock` 字段回吐锁态 |
+
+### 客户端
+```bash
+cmfa lock                    # 全锁 ALL
+cmfa lock VPN PROFILE        # 整份替换成这两条（旧的自动作废）
+cmfa unlock                  # 一键全解
+cmfa autostart on            # App 一启动就开 VPN
+cmfa profiles                # 拿 uuid
+cmfa activate <uuid>         # 锁着 UI 也能换配置
+cmfa groups && cmfa use "🚀节点选择" "🇯🇵日本节点"   # 锁着也能换节点
+cmfa on / cmfa off           # 锁着也能开关 VPN（API 永远畅通）
+```
+
+### 自启
+`MainApplication.onCreate` 起 9091 后读 `UiLock.autostart` 自动 `startClashService()`；
+`RestartReceiver` 收 `BOOT_COMPLETED`/`MY_PACKAGE_REPLACED` 时「API 开关 OR 旧 StatusProvider 开关」取或。
+未授 VpnService 权限时 `prepare()` 返回 pending，静默跳过不崩。
+
+### 坑
+- 崩溃/损坏提示页（`ApkBrokenActivity`/`AppCrashedActivity`）**不锁**，否则出问题连报错都看不到。
+- 锁状态只在主进程共享；`:background` 服务进程不读它，故不影响内核。
+- `ALL` 与其它位并存时 `UiLock.replace` 归一成纯 `ALL`。
+- 覆盖装后 9091 有 ~9s 空窗（`MY_PACKAGE_REPLACED` 自拉），别以为挂了，重试即可。

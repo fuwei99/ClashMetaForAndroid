@@ -12,6 +12,7 @@ import com.github.kr328.clash.design.MainDesign
 import com.github.kr328.clash.design.ui.ToastDuration
 import com.github.kr328.clash.remote.StatusClient
 import com.github.kr328.clash.service.model.Profile
+import com.github.kr328.clash.api.UiLock
 import com.github.kr328.clash.util.startClashService
 import com.github.kr328.clash.util.stopClashService
 import com.github.kr328.clash.util.withProfile
@@ -27,8 +28,20 @@ class ExternalControlActivity : Activity(), CoroutineScope by MainScope() {
         @Suppress("DEPRECATION")
         overridePendingTransition(0, 0)
 
+        // UI 锁：快捷方式 / 外部 Intent 也算 UI 入口，一并拦；API 9091 不受影响。
+        if (UiLock.isAllLocked(this)) {
+            Toast.makeText(this, "CMFA 已全锁，用 9091 API 操作", Toast.LENGTH_SHORT).show()
+            finish()
+            return
+        }
+
         when(intent.action) {
             Intent.ACTION_VIEW -> {
+                if (UiLock.isBlocked(this, "PROFILE")) {
+                    Toast.makeText(this, "配置导入已锁定，用 9091 API 操作", Toast.LENGTH_SHORT).show()
+                    finish()
+                    return
+                }
                 val uri = intent.data ?: return finish()
                 val url = uri.getQueryParameter("url") ?: return finish()
 
@@ -56,6 +69,11 @@ class ExternalControlActivity : Activity(), CoroutineScope by MainScope() {
             }
 
             Intents.ACTION_TOGGLE_CLASH -> {
+                if (UiLock.isBlocked(this, "VPN")) {
+                    Toast.makeText(this, "VPN 开关已锁定，用 9091 API 操作", Toast.LENGTH_SHORT).show()
+                    finish()
+                    return
+                }
                 if (isClashRunning()) {
                     stopClash()
                 } else {
@@ -64,6 +82,11 @@ class ExternalControlActivity : Activity(), CoroutineScope by MainScope() {
             }
             
             Intents.ACTION_START_CLASH -> {
+                if (UiLock.isBlocked(this, "VPN")) {
+                    Toast.makeText(this, "VPN 开关已锁定，用 9091 API 操作", Toast.LENGTH_SHORT).show()
+                    finish()
+                    return
+                }
                 if (isClashRunning()) {
                     Toast.makeText(this, R.string.external_control_started, Toast.LENGTH_LONG).show()
                 } else {
@@ -72,6 +95,11 @@ class ExternalControlActivity : Activity(), CoroutineScope by MainScope() {
             }
             
             Intents.ACTION_STOP_CLASH -> {
+                if (UiLock.isBlocked(this, "VPN")) {
+                    Toast.makeText(this, "VPN 开关已锁定，用 9091 API 操作", Toast.LENGTH_SHORT).show()
+                    finish()
+                    return
+                }
                 stopClash()
             }
         }

@@ -13,6 +13,7 @@ import com.github.kr328.clash.common.compat.registerReceiverCompat
 import com.github.kr328.clash.common.constants.Intents
 import com.github.kr328.clash.common.constants.Permissions
 import com.github.kr328.clash.remote.StatusClient
+import com.github.kr328.clash.api.UiLock
 import com.github.kr328.clash.util.startClashService
 import com.github.kr328.clash.util.stopClashService
 import com.github.kr328.clash.service.R
@@ -24,6 +25,9 @@ class TileService : TileService() {
 
     override fun onClick() {
         val tile = qsTile ?: return
+
+        // 磁贴也算 UI 入口：锁 VPN 或全锁时不响应（API 9091 不受影响）
+        if (UiLock.isAllLocked(this) || UiLock.isBlocked(this, "VPN")) return
 
         when (tile.state) {
             Tile.STATE_INACTIVE -> {

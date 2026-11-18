@@ -17,6 +17,7 @@ import com.github.kr328.clash.common.util.intent
 import com.github.kr328.clash.common.util.ticker
 import com.github.kr328.clash.design.MainDesign
 import com.github.kr328.clash.design.ui.ToastDuration
+import com.github.kr328.clash.api.UiLock
 import com.github.kr328.clash.util.startClashService
 import com.github.kr328.clash.util.stopClashService
 import com.github.kr328.clash.util.withClash
@@ -53,17 +54,19 @@ class MainActivity : BaseActivity<MainDesign>() {
                 design.requests.onReceive {
                     when (it) {
                         MainDesign.Request.ToggleStatus -> {
-                            if (clashRunning)
+                            if (UiLock.isBlocked(this@MainActivity, "VPN")) {
+                                android.widget.Toast.makeText(this@MainActivity, "VPN 开关已锁定，用 9091 API 操作", android.widget.Toast.LENGTH_SHORT).show()
+                            } else if (clashRunning)
                                 stopClashService()
                             else
                                 design.startClash()
                         }
                         MainDesign.Request.OpenProxy ->
-                            startActivity(ProxyActivity::class.intent)
+                            if (!UiLock.isBlocked(this@MainActivity, "PROXY")) startActivity(ProxyActivity::class.intent)
                         MainDesign.Request.OpenProfiles ->
-                            startActivity(ProfilesActivity::class.intent)
+                            if (!UiLock.isBlocked(this@MainActivity, "PROFILE")) startActivity(ProfilesActivity::class.intent)
                         MainDesign.Request.OpenProviders ->
-                            startActivity(ProvidersActivity::class.intent)
+                            if (!UiLock.isBlocked(this@MainActivity, "PROXY")) startActivity(ProvidersActivity::class.intent)
                         MainDesign.Request.OpenLogs -> {
                             if (LogcatService.running) {
                                 startActivity(LogcatActivity::class.intent)
@@ -72,7 +75,7 @@ class MainActivity : BaseActivity<MainDesign>() {
                             }
                         }
                         MainDesign.Request.OpenSettings ->
-                            startActivity(SettingsActivity::class.intent)
+                            if (!UiLock.isBlocked(this@MainActivity, "SETTINGS")) startActivity(SettingsActivity::class.intent)
                         MainDesign.Request.OpenHelp ->
                             startActivity(HelpActivity::class.intent)
                         MainDesign.Request.OpenAbout ->

@@ -30,6 +30,7 @@ import java.util.*
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
+import com.github.kr328.clash.api.UiLock
 import com.github.kr328.clash.design.R
 
 abstract class BaseActivity<D : Design<*>> : AppCompatActivity(),
@@ -89,6 +90,33 @@ abstract class BaseActivity<D : Design<*>> : AppCompatActivity(),
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         applyDayNight()
+
+        // UI 锁：只拦界面，API 控制面永远畅通。
+        // 崩溃/损坏提示页不锁，否则出问题时连报错都看不到。
+        val cls = this::class.java.simpleName
+        val exempt = cls == "ApkBrokenActivity" || cls == "AppCrashedActivity"
+        if (!exempt) {
+            val blockedKeys: List<String> = when (cls) {
+                "ProfilesActivity", "NewProfileActivity", "PropertiesActivity" ->
+                    listOf("PROFILE", "RULES")
+                "ProxyActivity", "ProvidersActivity" -> listOf("PROXY")
+                "OverrideSettingsActivity" -> listOf("RULES", "SETTINGS")
+                "SettingsActivity", "NetworkSettingsActivity", "AppSettingsActivity",
+                "MetaFeatureSettingsActivity", "AccessControlActivity" -> listOf("SETTINGS")
+                else -> emptyList()
+            }
+            val gated = UiLock.isAllLocked(this) ||
+                blockedKeys.any { UiLock.isBlocked(this, it) }
+            if (gated) {
+                android.widget.Toast.makeText(
+                    this,
+                    "CMFA 已锁定（${UiLock.rules(this).sorted().joinToString(",")}），用 9091 API 操作",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+                finish()
+                return
+            }
+        }
 
         // Apply excludeFromRecents setting to all app tasks.
         checkNotNull(getSystemService<ActivityManager>()).appTasks.forEach { task ->
